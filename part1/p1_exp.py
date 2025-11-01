@@ -1,3 +1,4 @@
+# p1_exp.py
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.link import TCLink
@@ -33,7 +34,8 @@ def compute_md5(file_path):
             # Read the file in chunks to avoid using too much memory for large files
             while chunk := file.read(8192):
                 hasher.update(chunk)
-        return hasher.hexdigest()
+        print(hasher.hexdigest())
+        return hasher.hexdigest() # Use mdigest() for bytes, or hexdigest() for string
     except FileNotFoundError:
         print(f"File not found: {file_path}")
         return None
@@ -55,7 +57,8 @@ def run(expname):
 
     SERVER_IP = "10.0.0.1"
     SERVER_PORT = 6555
-    SWS = 5 * 1180
+    # [FIX]: Use a large window to send more data at a time
+    SWS = 400 * 1180
             
     NUM_ITERATIONS = 5 
     OUTFILE = 'received_data.txt'
@@ -101,7 +104,10 @@ def run(expname):
                     start_time = time.time()
                     
                     h1.cmd(f"python3 p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} &")
+                    # Give server a moment to start up
+                    time.sleep(0.5) 
                     result = h2.cmd(f"python3 p1_client.py {SERVER_IP} {SERVER_PORT}")
+                    
                     end_time = time.time()
                     ttc = end_time - start_time
 
