@@ -2,14 +2,24 @@ import socket
 import sys
 import struct
 import time
-import os
 
-# --- Constants from Readme ---
+# --- Constants ---
 HEADER_SIZE = 20  # 4-byte seq_num + 16-byte reserved
 PACKET_SIZE = 1200
 OUTFILE = "received_data.txt"
-CONNECTION_TIMEOUT = 2.0 # 2-second timeout for retries
-CONNECTION_RETRIES = 5   # Retry up to 5 times
+CONNECTION_TIMEOUT = 2.0
+CONNECTION_RETRIES = 5
+SACK_BITMAP_BYTES = 16  # 128 bits
+
+
+def build_sack_bitmap(next_expected, received_dict):
+    """Build 128-bit bitmap (16 bytes) marking received packets."""
+    bits = 0
+    for i in range(SACK_BITMAP_BYTES * 8):
+        if (next_expected + i) in received_dict:
+            bits |= (1 << i)
+    return bits.to_bytes(SACK_BITMAP_BYTES, byteorder='little')
+
 
 def main():
     if len(sys.argv) != 3:
@@ -23,22 +33,20 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(CONNECTION_TIMEOUT)
 
-    # --- Connection Setup: 1-byte message, 5 retries ---
-    request_packet = b'\x01' # A single byte
+    # --- Connection Setup ---
+    request_packet = b'\x01'
     first_packet = None
-    
+
     for i in range(CONNECTION_RETRIES):
         try:
             print(f"Sending file request to {server_addr} (Attempt {i+1}/{CONNECTION_RETRIES})")
             sock.sendto(request_packet, server_addr)
-            
-            # Wait for the *first data packet*
             first_packet, _ = sock.recvfrom(PACKET_SIZE)
             print("Received first packet from server. Connection established.")
-            break # Success
+            break
         except socket.timeout:
             print("Connection request timed out.")
-            
+
     if not first_packet:
         print(f"Server is unresponsive after {CONNECTION_RETRIES} attempts. Terminating.")
         sock.close()
@@ -46,62 +54,95 @@ def main():
 
     # --- Main Receive Loop ---
     expected_seq_num = 0
-    
-    try:
-        with open(OUTFILE, 'wb') as f:
-            # Process the first packet we already received
-            packet_to_process = first_packet
-            
-            while True:
-                try:
-                    # Process the packet (either the first one or a new one)
-                    if packet_to_process:
-                        header = packet_to_process[:HEADER_SIZE]
-                        payload = packet_to_process[HEADER_SIZE:]
-                        seq_num, = struct.unpack('!I', header[:4]) # Unpack 4 bytes
-                        
-                        # Clear the packet buffer
-                        packet_to_process = None
-                        
-                        # Check for EOF
-                        if payload == b"EOF":
-                            print(f"Received EOF packet {seq_num}. Download complete.")
-                            # ACK the EOF packet
-                            # The next "expected" packet would be seq_num + 1
-                            ack_packet = struct.pack('!I 16x', seq_num + 1)
-                            for _ in range(5): # Send final ACK multiple times
-                                sock.sendto(ack_packet, server_addr)
-                            break # Terminate client
-                        
-                        # Check for in-order DATA
-                        if seq_num == expected_seq_num:
-                            # print(f"Received in-order packet {seq_num}")
-                            f.write(payload)
-                            expected_seq_num += 1
-                        # else:
-                            # print(f"Received out-of-order {seq_num}. Expecting {expected_seq_num}. Discarding.")
-                        
-                        # Send cumulative ACK for the *next* packet we expect
-                        ack_packet = struct.pack('!I 16x', expected_seq_num)
-                        sock.sendto(ack_packet, server_addr)
+    received = {}          # seq_num -> payload
+    data_buffer = bytearray()
+    eof_seq = None
 
-                    # Wait for the next packet
-                    packet_to_process, _ = sock.recvfrom(PACKET_SIZE)
-                    
-                except socket.timeout:
-                    print(f"Client timeout: No response. Resending ACK for {expected_seq_num}")
-                    # Resend last cumulative ACK
-                    ack_packet = struct.pack('!I 16x', expected_seq_num)
+    try:
+        packet_to_process = first_packet
+
+        while True:
+            try:
+                if packet_to_process:
+                    header = packet_to_process[:HEADER_SIZE]
+                    payload = packet_to_process[HEADER_SIZE:]
+                    seq_num, = struct.unpack('!I', header[:4])
+                    packet_to_process = None
+
+                    if not payload:
+                        # Ignore empty payloads
+                        packet_to_process = None
+                        continue
+
+                    # --- Handle EOF ---
+                    if payload == b"EOF":
+                        if eof_seq is None:
+                            eof_seq = seq_num
+                            print(f"Received EOF packet seq={seq_num}. Marked EOF in buffer.")
+                            received[seq_num] = b''  # mark EOF as received
+                        else:
+                            print(f"Duplicate EOF packet seq={seq_num} ignored.")
+                    else:
+                        # Normal data packet
+                        if seq_num not in received:
+                            received[seq_num] = payload
+
+                    # Deliver in order up to EOF
+                    while expected_seq_num in received and expected_seq_num != eof_seq:
+                        chunk = received.pop(expected_seq_num)
+                        data_buffer.extend(chunk)
+                        expected_seq_num += 1
+
+                    # Build SACK bitmap relative to expected_seq_num
+                    bitmap = build_sack_bitmap(expected_seq_num, received)
+                    ack_packet = struct.pack('!I', expected_seq_num) + bitmap
                     sock.sendto(ack_packet, server_addr)
 
-    except IOError as e:
-        print(f"Error: Could not open output file {OUTFILE}. Error: {e}")
+                    # If EOF received and all data delivered, exit
+                    if eof_seq is not None:
+                        all_received = all(
+                            seq in received or seq < expected_seq_num
+                            for seq in range(0, eof_seq + 1)
+                        )
+                        if all_received:
+                            print("All data up to EOF received and written to buffer.")
+                            for _ in range(5):
+                                sock.sendto(ack_packet, server_addr)
+                            break
+
+                # Wait for next packet
+                packet_to_process, _ = sock.recvfrom(PACKET_SIZE)
+
+            except socket.timeout:
+                # On timeout, resend ACK with current SACK bitmap
+                if eof_seq is not None:
+                    print(f"Client timeout after EOF. Resent final ACK next_expected={expected_seq_num}")
+                else:
+                    print(f"Client timeout. Resending ACK next_expected={expected_seq_num}")
+
+                bitmap = build_sack_bitmap(expected_seq_num, received)
+                ack_packet = struct.pack('!I', expected_seq_num) + bitmap
+                try:
+                    if eof_seq is not None:
+                        for _ in range(5):
+                            sock.sendto(ack_packet, server_addr)
+                    else:
+                        sock.sendto(ack_packet, server_addr)
+                except Exception as e:
+                    print("Failed to resend ACK:", e)
+
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
-        print(f"File written to {OUTFILE}. Client shutting down.")
+        try:
+            with open(OUTFILE, 'wb') as f:
+                f.write(data_buffer)
+            print(f"File written to {OUTFILE}. Size: {len(data_buffer)} bytes.")
+        except Exception as e:
+            print(f"Error writing output file: {e}")
         sock.close()
+        print("Client shutting down.")
+
 
 if __name__ == "__main__":
     main()
-
